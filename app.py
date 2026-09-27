@@ -94,52 +94,140 @@ def split_languages(text):
 
 
 def build_segments(text, english):
-    """Return [(voice, text), ...] ready to synthesize, in reading order."""
+    """Return a list of segments ready to synthesize, in reading order.
+
+    Each segment is a dict with voice, text, and trim_start/trim_end flags that
+    mark a language switch in the middle of a line. There the silence edge-tts
+    puts around every clip is trimmed, so Thai and English flow together.
+    """
     if english not in ENGLISH_VOICES:
-        return [(VOICE, chunk) for chunk in split_text(text)]
-    result = []
+        return [new_segment(VOICE, chunk) for chunk in split_text(text)]
+    segments = []
+    line_break = True  # whether a line/paragraph break precedes the next chunk
     for lang, part in split_languages(text):
         voice = ENGLISH_VOICES[english] if lang == "en" else VOICE
-        for chunk in split_text(part):
-            if not SPEAKABLE.search(chunk):
-                continue
-            if result and result[-1][0] == voice and (
-                len(result[-1][1]) + len(chunk) + 1 <= MAX_CHUNK_CHARS
+        chunks = [c for c in split_text(part) if SPEAKABLE.search(c)]
+        if not chunks:
+            line_break = line_break or "\n" in part
+            continue
+        if re.match(r"[ \t]*\n", part):
+            line_break = True
+        for index, chunk in enumerate(chunks):
+            inline = index == 0 and not line_break and bool(segments)
+            prev = segments[-1] if segments else None
+            if inline and prev["voice"] == voice and (
+                len(prev["text"]) + len(chunk) + 1 <= MAX_CHUNK_CHARS
             ):
-                result[-1] = (voice, result[-1][1] + " " + chunk)
-            else:
-                result.append((voice, chunk))
-    return result
+                prev["text"] += " " + chunk
+                continue
+            if inline:
+                prev["trim_end"] = True
+            segments.append(new_segment(voice, chunk, trim_start=inline))
+            line_break = False
+        line_break = bool(re.search(r"\n[ \t]*$", part))
+    return segments
+
+
+def new_segment(voice, text, trim_start=False):
+    return {"voice": voice, "text": text, "trim_start": trim_start, "trim_end": False}
+
+
+# --- MP3 frame trimming (no re-encoding, no ffmpeg needed) -------------------
+
+LEAD_SECONDS = 0.05  # silence kept before speech at a language switch
+TAIL_SECONDS = 0.12  # silence kept after speech at a language switch
+TAIL_SENTENCE_SECONDS = 0.35  # ...when the clip ends a sentence (. ! ?)
+MP3_BITRATES = {
+    1: [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],
+    2: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+}
+MP3_SAMPLE_RATES = {3: (44100, 48000, 32000), 2: (22050, 24000, 16000), 0: (11025, 12000, 8000)}
+
+
+def mp3_frames(data):
+    """Yield (offset, size, seconds) for each MPEG Layer III frame in data."""
+    i = 0
+    if data[:3] == b"ID3" and len(data) >= 10:
+        i = 10 + ((data[6] << 21) | (data[7] << 14) | (data[8] << 7) | data[9])
+    while i + 4 <= len(data):
+        header = int.from_bytes(data[i : i + 4], "big")
+        version = (header >> 19) & 3
+        layer = (header >> 17) & 3
+        bitrate_index = (header >> 12) & 0xF
+        rate_index = (header >> 10) & 3
+        if (
+            (header >> 21) != 0x7FF
+            or version == 1
+            or layer != 1
+            or bitrate_index in (0, 15)
+            or rate_index == 3
+        ):
+            i += 1
+            continue
+        mpeg1 = version == 3
+        sample_rate = MP3_SAMPLE_RATES[version][rate_index]
+        bitrate = MP3_BITRATES[1 if mpeg1 else 2][bitrate_index] * 1000
+        size = (144 if mpeg1 else 72) * bitrate // sample_rate + ((header >> 9) & 1)
+        yield i, size, (1152 if mpeg1 else 576) / sample_rate
+        i += size
+
+
+def trim_mp3(data, start, end):
+    """Keep only whole frames overlapping [start, end) seconds."""
+    out = bytearray()
+    t = 0.0
+    for offset, size, seconds in mp3_frames(data):
+        if t + seconds > start and t < end:
+            out += data[offset : offset + size]
+        t += seconds
+    return bytes(out) if out else data
+
+
+def trim_segment_audio(segment, audio, speech):
+    if not speech or not (segment["trim_start"] or segment["trim_end"]):
+        return audio
+    speech_start, speech_end = speech
+    start = speech_start - LEAD_SECONDS if segment["trim_start"] else 0.0
+    tail = TAIL_SENTENCE_SECONDS if re.search(r"[.!?]$", segment["text"]) else TAIL_SECONDS
+    end = speech_end + tail if segment["trim_end"] else float("inf")
+    return trim_mp3(audio, max(0.0, start), end)
 
 
 async def synthesize_chunk(text, voice, rate):
+    """Return (mp3_bytes, (speech_start, speech_end) in seconds or None)."""
     communicate = edge_tts.Communicate(text, voice, rate=rate)
     audio = bytearray()
+    starts, ends = [], []
     async for message in communicate.stream():
         if message["type"] == "audio":
             audio.extend(message["data"])
+        elif message["type"] in ("SentenceBoundary", "WordBoundary"):
+            starts.append(message["offset"] / 1e7)  # 100-ns units -> seconds
+            ends.append((message["offset"] + message["duration"]) / 1e7)
     if not audio:
         raise RuntimeError("ไม่ได้รับเสียงจากบริการ edge-tts")
-    return bytes(audio)
+    return bytes(audio), ((min(starts), max(ends)) if starts else None)
 
 
 async def synthesize_all(job, segments, rate):
     semaphore = asyncio.Semaphore(CONCURRENCY)
 
-    async def one(voice, text):
+    async def one(segment):
         async with semaphore:
             for attempt in range(1, RETRIES + 1):
                 try:
-                    audio = await synthesize_chunk(text, voice, rate)
+                    audio, speech = await synthesize_chunk(
+                        segment["text"], segment["voice"], rate
+                    )
                     break
                 except Exception:
                     if attempt == RETRIES:
                         raise
                     await asyncio.sleep(2 * attempt)
             job["done"] += 1
-            return audio
+            return trim_segment_audio(segment, audio, speech)
 
-    return await asyncio.gather(*(one(voice, text) for voice, text in segments))
+    return await asyncio.gather(*(one(segment) for segment in segments))
 
 
 def run_job(job_id, segments, rate):
