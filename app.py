@@ -14,6 +14,7 @@ import time
 import uuid
 
 import edge_tts
+import miniaudio
 from flask import Flask, Response, abort, jsonify, render_template, request
 
 VOICE = "th-TH-PremwadeeNeural"
@@ -97,9 +98,9 @@ def split_languages(text):
 def build_segments(text, english):
     """Return a list of segments ready to synthesize, in reading order.
 
-    Each segment is a dict with voice, text, and trim_start/trim_end flags that
-    mark a language switch in the middle of a line. There the silence edge-tts
-    puts around every clip is trimmed, so Thai and English flow together.
+    Each segment is a dict with voice and text. Where the voice switches
+    between Thai and English, trim_end/trim_start and pause_after are set so
+    the long silence edge-tts puts around every clip is cut to a short pause.
     """
     if english not in ENGLISH_VOICES:
         return [new_segment(VOICE, chunk) for chunk in split_text(text)]
@@ -114,30 +115,43 @@ def build_segments(text, english):
         if re.match(r"[ \t]*\n", part):
             line_break = True
         for index, chunk in enumerate(chunks):
-            inline = index == 0 and not line_break and bool(segments)
             prev = segments[-1] if segments else None
-            if inline and prev["voice"] == voice and (
+            first = index == 0 and prev is not None
+            if first and not line_break and prev["voice"] == voice and (
                 len(prev["text"]) + len(chunk) + 1 <= MAX_CHUNK_CHARS
             ):
                 prev["text"] += " " + chunk
                 continue
-            if inline:
+            segment = new_segment(voice, chunk)
+            if first and prev["voice"] != voice:
+                sentence_end = line_break or re.search(r"[.!?]$", prev["text"])
                 prev["trim_end"] = True
-            segments.append(new_segment(voice, chunk, trim_start=inline))
+                prev["pause_after"] = PAUSE_SENTENCE if sentence_end else PAUSE_INLINE
+                segment["trim_start"] = True
+            segments.append(segment)
             line_break = False
         line_break = bool(re.search(r"\n[ \t]*$", part))
     return segments
 
 
-def new_segment(voice, text, trim_start=False):
-    return {"voice": voice, "text": text, "trim_start": trim_start, "trim_end": False}
+def new_segment(voice, text):
+    return {
+        "voice": voice,
+        "text": text,
+        "trim_start": False,
+        "trim_end": False,
+        "pause_after": 0.0,
+    }
 
 
-# --- MP3 frame trimming (no re-encoding, no ffmpeg needed) -------------------
+# --- Silence trimming at language switches -----------------------------------
+# The audio is decoded only to find where speech starts and ends; the MP3 is
+# then cut at whole frames, so there is no re-encoding and no ffmpeg needed.
 
-LEAD_SECONDS = 0.05  # silence kept before speech at a language switch
-TAIL_SECONDS = 0.12  # silence kept after speech at a language switch
-TAIL_SENTENCE_SECONDS = 0.35  # ...when the clip ends a sentence (. ! ?)
+PAUSE_INLINE = 0.25  # pause at a switch in the middle of a sentence
+PAUSE_SENTENCE = 0.5  # pause at a switch after . ! ? or a line break
+LEAD_SECONDS = 0.05  # silence kept before speech starts
+SILENCE_RATIO = 0.03  # quieter than 3% of the clip's peak counts as silence
 MP3_BITRATES = {
     1: [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],
     2: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
@@ -184,30 +198,60 @@ def trim_mp3(data, start, end):
     return bytes(out) if out else data
 
 
-def trim_segment_audio(segment, audio, speech):
-    if not speech or not (segment["trim_start"] or segment["trim_end"]):
+def speech_bounds(data):
+    """Return (start, end) in seconds of the audible part of an MP3, or None."""
+    try:
+        decoded = miniaudio.decode(
+            bytes(data),
+            output_format=miniaudio.SampleFormat.SIGNED16,
+            nchannels=1,
+            sample_rate=16000,  # plenty to find speech, and light on memory
+        )
+    except Exception:  # noqa: BLE001 - trimming is best effort
+        return None
+    samples = decoded.samples
+    rate = decoded.sample_rate
+    if not samples:
+        return None
+    peak = max(max(samples), -min(samples))
+    threshold = max(int(peak * SILENCE_RATIO), 50)
+    window = max(1, rate // 100)  # 10 ms
+
+    def loud(i):
+        chunk = samples[i : i + window]
+        return max(chunk) > threshold or -min(chunk) > threshold
+
+    starts = range(0, len(samples), window)
+    first = next((i for i in starts if loud(i)), None)
+    if first is None:
+        return None
+    last = next(i for i in reversed(starts) if loud(i))
+    return first / rate, min(len(samples), last + window) / rate
+
+
+def trim_segment_audio(segment, audio):
+    if not (segment["trim_start"] or segment["trim_end"]):
         return audio
-    speech_start, speech_end = speech
-    start = speech_start - LEAD_SECONDS if segment["trim_start"] else 0.0
-    tail = TAIL_SENTENCE_SECONDS if re.search(r"[.!?]$", segment["text"]) else TAIL_SECONDS
-    end = speech_end + tail if segment["trim_end"] else float("inf")
+    bounds = speech_bounds(audio)
+    if not bounds:
+        return audio
+    start = bounds[0] - LEAD_SECONDS if segment["trim_start"] else 0.0
+    # The next clip keeps LEAD_SECONDS of its own silence, so this clip keeps
+    # the rest of the wanted pause.
+    tail = max(0.0, segment["pause_after"] - LEAD_SECONDS)
+    end = bounds[1] + tail if segment["trim_end"] else float("inf")
     return trim_mp3(audio, max(0.0, start), end)
 
 
 async def synthesize_chunk(text, voice, rate):
-    """Return (mp3_bytes, (speech_start, speech_end) in seconds or None)."""
     communicate = edge_tts.Communicate(text, voice, rate=rate)
     audio = bytearray()
-    starts, ends = [], []
     async for message in communicate.stream():
         if message["type"] == "audio":
             audio.extend(message["data"])
-        elif message["type"] in ("SentenceBoundary", "WordBoundary"):
-            starts.append(message["offset"] / 1e7)  # 100-ns units -> seconds
-            ends.append((message["offset"] + message["duration"]) / 1e7)
     if not audio:
         raise RuntimeError("ไม่ได้รับเสียงจากบริการ edge-tts")
-    return bytes(audio), ((min(starts), max(ends)) if starts else None)
+    return bytes(audio)
 
 
 async def synthesize_all(job, segments):
@@ -217,7 +261,7 @@ async def synthesize_all(job, segments):
         async with semaphore:
             for attempt in range(1, RETRIES + 1):
                 try:
-                    audio, speech = await synthesize_chunk(
+                    audio = await synthesize_chunk(
                         segment["text"], segment["voice"], segment["rate"]
                     )
                     break
@@ -226,7 +270,7 @@ async def synthesize_all(job, segments):
                         raise
                     await asyncio.sleep(2 * attempt)
             job["done"] += 1
-            return trim_segment_audio(segment, audio, speech)
+            return trim_segment_audio(segment, audio)
 
     return await asyncio.gather(*(one(segment) for segment in segments))
 
