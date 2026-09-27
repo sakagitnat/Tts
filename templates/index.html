@@ -82,6 +82,17 @@
     .speed { display: flex; align-items: center; gap: 10px; flex: 1 1 260px; }
     .speed input { flex: 1; accent-color: var(--accent); height: 32px; }
     .speed output { min-width: 4.5em; text-align: right; font-variant-numeric: tabular-nums; }
+    .english { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; flex: 1 1 100%; }
+    select {
+      flex: 1 1 260px;
+      min-height: 48px;
+      padding: 0 12px;
+      font: inherit;
+      color: var(--text);
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+    }
     button, .button {
       display: inline-flex;
       align-items: center;
@@ -116,7 +127,7 @@
 <body>
 <main>
   <h1>แปลงข้อความไทยเป็นไฟล์เสียง MP3</h1>
-  <p class="sub">เสียงผู้หญิง “เปรมวดี” (th-TH-PremwadeeNeural) · ข้อความยาวแค่ไหนก็รวมเป็นไฟล์เดียว</p>
+  <p class="sub">เสียงผู้หญิง “เปรมวดี” (th-TH-PremwadeeNeural) · คำภาษาอังกฤษอ่านด้วยเสียงอังกฤษได้ · ข้อความยาวแค่ไหนก็รวมเป็นไฟล์เดียว</p>
 
   <section class="card">
     <textarea id="text" placeholder="วางข้อความภาษาไทยที่นี่…" maxlength="{{ max_chars }}"></textarea>
@@ -129,6 +140,16 @@
         <span>ความเร็ว</span>
         <input type="range" id="speed" min="-50" max="100" step="5" value="0">
         <output id="speedOut">ปกติ</output>
+      </label>
+    </div>
+    <div class="row">
+      <label class="english">
+        <span>คำภาษาอังกฤษ</span>
+        <select id="english">
+          <option value="us">อ่านด้วยเสียงภาษาอังกฤษ (สำเนียงอเมริกัน)</option>
+          <option value="gb">อ่านด้วยเสียงภาษาอังกฤษ (สำเนียงอังกฤษ)</option>
+          <option value="off">ให้เปรมวดีอ่านทั้งหมด (สำเนียงไทย)</option>
+        </select>
       </label>
     </div>
     <button class="primary" id="go" type="button">🔊 แปลงเป็น MP3</button>
@@ -152,6 +173,7 @@
 <script>
   const $ = (id) => document.getElementById(id);
   const textEl = $("text"), countEl = $("count"), speedEl = $("speed"), speedOut = $("speedOut");
+  const englishEl = $("english");
   const goBtn = $("go"), statusEl = $("status"), bar = $("bar");
   const progressCard = $("progressCard"), resultCard = $("resultCard");
   const player = $("player"), downloadLink = $("download"), sizeEl = $("size");
@@ -169,10 +191,13 @@
 
   textEl.value = load("tts-text") || "";
   speedEl.value = load("tts-speed") || "0";
+  englishEl.value = load("tts-english") || "us";
+  if (!englishEl.value) englishEl.value = "us";
   updateCount(); updateSpeed();
 
   textEl.addEventListener("input", () => { updateCount(); save("tts-text", textEl.value); });
   speedEl.addEventListener("input", () => { updateSpeed(); save("tts-speed", speedEl.value); });
+  englishEl.addEventListener("change", () => save("tts-english", englishEl.value));
   $("clear").addEventListener("click", () => {
     if (textEl.value && !confirm("ล้างข้อความทั้งหมด?")) return;
     textEl.value = ""; updateCount(); save("tts-text", ""); textEl.focus();
@@ -205,7 +230,7 @@
       const res = await fetch("api/jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, speed: Number(speedEl.value) }),
+        body: JSON.stringify({ text, speed: Number(speedEl.value), english: englishEl.value }),
       });
       const job = await res.json();
       if (!res.ok) throw new Error(job.error || "เกิดข้อผิดพลาด");

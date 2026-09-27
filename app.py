@@ -1,7 +1,8 @@
 """Thai text -> MP3 web app using edge-tts (th-TH-PremwadeeNeural).
 
 Long text is split into chunks, each chunk is synthesized separately, and the
-MP3 pieces are joined into one file. Work runs in a background thread so the
+MP3 pieces are joined into one file. English runs inside the text can be read
+by an English voice, because the Thai voice mispronounces English words. Work runs in a background thread so the
 browser can poll for progress instead of waiting on one long request.
 """
 
@@ -16,6 +17,12 @@ import edge_tts
 from flask import Flask, Response, abort, jsonify, render_template, request
 
 VOICE = "th-TH-PremwadeeNeural"
+ENGLISH_VOICES = {
+    "us": "en-US-JennyNeural",
+    "gb": "en-GB-SoniaNeural",
+}
+DEFAULT_ENGLISH = "us"
+CONCURRENCY = 4
 MAX_CHUNK_CHARS = 1500
 MAX_TEXT_CHARS = int(os.environ.get("MAX_TEXT_CHARS", "100000"))
 JOB_TTL_SECONDS = 60 * 60
@@ -64,8 +71,49 @@ def split_text(text, max_chars=MAX_CHUNK_CHARS):
     return chunks
 
 
-async def synthesize_chunk(text, rate):
-    communicate = edge_tts.Communicate(text, VOICE, rate=rate)
+# A run of English: starts with a Latin letter and may continue with Latin
+# letters, digits, spaces and common punctuation, e.g. "iPhone 15 Pro, Apple".
+ENGLISH_RUN = re.compile(r"[A-Za-z][A-Za-z0-9'’&.,:;!?%()\-/+#@_ \t]*")
+SPEAKABLE = re.compile(r"[0-9A-Za-z\u0E00-\u0E7F]")
+
+
+def split_languages(text):
+    """Split text into [(lang, text), ...] where lang is "th" or "en"."""
+    segments = []
+    pos = 0
+    for match in ENGLISH_RUN.finditer(text):
+        run = match.group().rstrip(" \t,:;(-/")
+        start, end = match.start(), match.start() + len(run)
+        if start > pos:
+            segments.append(("th", text[pos:start]))
+        segments.append(("en", run))
+        pos = end
+    if pos < len(text):
+        segments.append(("th", text[pos:]))
+    return segments
+
+
+def build_segments(text, english):
+    """Return [(voice, text), ...] ready to synthesize, in reading order."""
+    if english not in ENGLISH_VOICES:
+        return [(VOICE, chunk) for chunk in split_text(text)]
+    result = []
+    for lang, part in split_languages(text):
+        voice = ENGLISH_VOICES[english] if lang == "en" else VOICE
+        for chunk in split_text(part):
+            if not SPEAKABLE.search(chunk):
+                continue
+            if result and result[-1][0] == voice and (
+                len(result[-1][1]) + len(chunk) + 1 <= MAX_CHUNK_CHARS
+            ):
+                result[-1] = (voice, result[-1][1] + " " + chunk)
+            else:
+                result.append((voice, chunk))
+    return result
+
+
+async def synthesize_chunk(text, voice, rate):
+    communicate = edge_tts.Communicate(text, voice, rate=rate)
     audio = bytearray()
     async for message in communicate.stream():
         if message["type"] == "audio":
@@ -75,22 +123,31 @@ async def synthesize_chunk(text, rate):
     return bytes(audio)
 
 
-def run_job(job_id, chunks, rate):
-    job = jobs[job_id]
-    parts = []
-    try:
-        for index, chunk in enumerate(chunks):
+async def synthesize_all(job, segments, rate):
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+
+    async def one(voice, text):
+        async with semaphore:
             for attempt in range(1, RETRIES + 1):
                 try:
-                    parts.append(asyncio.run(synthesize_chunk(chunk, rate)))
+                    audio = await synthesize_chunk(text, voice, rate)
                     break
                 except Exception:
                     if attempt == RETRIES:
                         raise
-                    time.sleep(2 * attempt)
-            job["done"] = index + 1
-        # edge-tts returns MP3 frames with identical settings for every chunk,
-        # so plain concatenation yields one valid, continuous MP3 file.
+                    await asyncio.sleep(2 * attempt)
+            job["done"] += 1
+            return audio
+
+    return await asyncio.gather(*(one(voice, text) for voice, text in segments))
+
+
+def run_job(job_id, segments, rate):
+    job = jobs[job_id]
+    try:
+        parts = asyncio.run(synthesize_all(job, segments, rate))
+        # edge-tts returns MP3 frames with identical settings (24 kHz mono) for
+        # every voice, so plain concatenation yields one valid MP3 file.
         job["audio"] = b"".join(parts)
         job["status"] = "finished"
     except Exception as exc:  # noqa: BLE001 - report any failure to the user
@@ -127,19 +184,22 @@ def create_job():
     speed = max(-50, min(100, speed))
     rate = f"{speed:+d}%"
 
-    chunks = split_text(text)
+    english = data.get("english", DEFAULT_ENGLISH)
+    segments = build_segments(text, english)
+    if not segments:
+        return jsonify(error="ไม่พบข้อความที่อ่านออกเสียงได้"), 400
     job_id = uuid.uuid4().hex
     with jobs_lock:
         jobs[job_id] = {
             "status": "running",
             "done": 0,
-            "total": len(chunks),
+            "total": len(segments),
             "audio": None,
             "error": None,
             "created": time.time(),
         }
-    threading.Thread(target=run_job, args=(job_id, chunks, rate), daemon=True).start()
-    return jsonify(id=job_id, total=len(chunks))
+    threading.Thread(target=run_job, args=(job_id, segments, rate), daemon=True).start()
+    return jsonify(id=job_id, total=len(segments))
 
 
 @app.get("/api/jobs/<job_id>")
