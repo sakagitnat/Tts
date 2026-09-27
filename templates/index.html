@@ -81,7 +81,7 @@
     .count { color: var(--muted); font-size: 0.95rem; }
     .speed { display: flex; align-items: center; gap: 10px; flex: 1 1 260px; }
     .speed input { flex: 1; accent-color: var(--accent); height: 32px; }
-    .speed output { min-width: 4.5em; text-align: right; font-variant-numeric: tabular-nums; }
+    .speed output { min-width: 6.5em; text-align: right; font-variant-numeric: tabular-nums; }
     .english { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; flex: 1 1 100%; }
     select {
       flex: 1 1 260px;
@@ -137,7 +137,7 @@
     </div>
     <div class="row">
       <label class="speed">
-        <span>ความเร็ว</span>
+        <span>ความเร็วภาษาไทย</span>
         <input type="range" id="speed" min="-50" max="100" step="5" value="0">
         <output id="speedOut">ปกติ</output>
       </label>
@@ -150,6 +150,13 @@
           <option value="gb">อ่านด้วยเสียงภาษาอังกฤษ (สำเนียงอังกฤษ)</option>
           <option value="off">ให้เปรมวดีอ่านทั้งหมด (สำเนียงไทย)</option>
         </select>
+      </label>
+    </div>
+    <div class="row" id="englishSpeedRow">
+      <label class="speed">
+        <span>ความเร็วภาษาอังกฤษ</span>
+        <input type="range" id="englishSpeed" min="-50" max="50" step="5" value="-25">
+        <output id="englishSpeedOut"></output>
       </label>
     </div>
     <button class="primary" id="go" type="button">🔊 แปลงเป็น MP3</button>
@@ -173,7 +180,8 @@
 <script>
   const $ = (id) => document.getElementById(id);
   const textEl = $("text"), countEl = $("count"), speedEl = $("speed"), speedOut = $("speedOut");
-  const englishEl = $("english");
+  const englishEl = $("english"), englishSpeedEl = $("englishSpeed");
+  const englishSpeedOut = $("englishSpeedOut"), englishSpeedRow = $("englishSpeedRow");
   const goBtn = $("go"), statusEl = $("status"), bar = $("bar");
   const progressCard = $("progressCard"), resultCard = $("resultCard");
   const player = $("player"), downloadLink = $("download"), sizeEl = $("size");
@@ -184,20 +192,28 @@
   function updateCount() {
     countEl.textContent = textEl.value.length.toLocaleString("th-TH") + " ตัวอักษร";
   }
+  function speedLabel(v) {
+    v = Number(v);
+    if (v === 0) return "ปกติ";
+    return v < 0 ? "ช้าลง " + -v + "%" : "เร็วขึ้น " + v + "%";
+  }
   function updateSpeed() {
-    const v = Number(speedEl.value);
-    speedOut.textContent = v === 0 ? "ปกติ" : (v > 0 ? "+" : "") + v + "%";
+    speedOut.textContent = speedLabel(speedEl.value);
+    englishSpeedOut.textContent = speedLabel(englishSpeedEl.value);
+    englishSpeedRow.hidden = englishEl.value === "off";
   }
 
   textEl.value = load("tts-text") || "";
   speedEl.value = load("tts-speed") || "0";
   englishEl.value = load("tts-english") || "us";
   if (!englishEl.value) englishEl.value = "us";
+  englishSpeedEl.value = load("tts-english-speed") || "-25";
   updateCount(); updateSpeed();
 
   textEl.addEventListener("input", () => { updateCount(); save("tts-text", textEl.value); });
   speedEl.addEventListener("input", () => { updateSpeed(); save("tts-speed", speedEl.value); });
-  englishEl.addEventListener("change", () => save("tts-english", englishEl.value));
+  englishEl.addEventListener("change", () => { updateSpeed(); save("tts-english", englishEl.value); });
+  englishSpeedEl.addEventListener("input", () => { updateSpeed(); save("tts-english-speed", englishSpeedEl.value); });
   $("clear").addEventListener("click", () => {
     if (textEl.value && !confirm("ล้างข้อความทั้งหมด?")) return;
     textEl.value = ""; updateCount(); save("tts-text", ""); textEl.focus();
@@ -230,7 +246,8 @@
       const res = await fetch("api/jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, speed: Number(speedEl.value), english: englishEl.value }),
+        body: JSON.stringify({ text, speed: Number(speedEl.value), english: englishEl.value,
+          english_speed: Number(englishSpeedEl.value) }),
       });
       const job = await res.json();
       if (!res.ok) throw new Error(job.error || "เกิดข้อผิดพลาด");

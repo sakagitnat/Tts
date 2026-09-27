@@ -22,6 +22,7 @@ ENGLISH_VOICES = {
     "gb": "en-GB-SoniaNeural",
 }
 DEFAULT_ENGLISH = "us"
+DEFAULT_ENGLISH_SPEED = -25  # slower English is easier to follow and learn
 CONCURRENCY = 4
 MAX_CHUNK_CHARS = 1500
 MAX_TEXT_CHARS = int(os.environ.get("MAX_TEXT_CHARS", "100000"))
@@ -209,7 +210,7 @@ async def synthesize_chunk(text, voice, rate):
     return bytes(audio), ((min(starts), max(ends)) if starts else None)
 
 
-async def synthesize_all(job, segments, rate):
+async def synthesize_all(job, segments):
     semaphore = asyncio.Semaphore(CONCURRENCY)
 
     async def one(segment):
@@ -217,7 +218,7 @@ async def synthesize_all(job, segments, rate):
             for attempt in range(1, RETRIES + 1):
                 try:
                     audio, speech = await synthesize_chunk(
-                        segment["text"], segment["voice"], rate
+                        segment["text"], segment["voice"], segment["rate"]
                     )
                     break
                 except Exception:
@@ -230,10 +231,10 @@ async def synthesize_all(job, segments, rate):
     return await asyncio.gather(*(one(segment) for segment in segments))
 
 
-def run_job(job_id, segments, rate):
+def run_job(job_id, segments):
     job = jobs[job_id]
     try:
-        parts = asyncio.run(synthesize_all(job, segments, rate))
+        parts = asyncio.run(synthesize_all(job, segments))
         # edge-tts returns MP3 frames with identical settings (24 kHz mono) for
         # every voice, so plain concatenation yields one valid MP3 file.
         job["audio"] = b"".join(parts)
@@ -255,6 +256,15 @@ def index():
     return render_template("index.html", max_chars=MAX_TEXT_CHARS)
 
 
+def parse_rate(value, default):
+    """Turn a speed percentage from the page into an edge-tts rate string."""
+    try:
+        speed = int(value)
+    except (TypeError, ValueError):
+        speed = default
+    return f"{max(-50, min(100, speed)):+d}%"
+
+
 @app.post("/api/jobs")
 def create_job():
     cleanup_old_jobs()
@@ -265,17 +275,14 @@ def create_job():
     if len(text) > MAX_TEXT_CHARS:
         return jsonify(error=f"ข้อความยาวเกิน {MAX_TEXT_CHARS:,} ตัวอักษร"), 400
 
-    try:
-        speed = int(data.get("speed", 0))
-    except (TypeError, ValueError):
-        speed = 0
-    speed = max(-50, min(100, speed))
-    rate = f"{speed:+d}%"
-
+    thai_rate = parse_rate(data.get("speed"), 0)
+    english_rate = parse_rate(data.get("english_speed"), DEFAULT_ENGLISH_SPEED)
     english = data.get("english", DEFAULT_ENGLISH)
     segments = build_segments(text, english)
     if not segments:
         return jsonify(error="ไม่พบข้อความที่อ่านออกเสียงได้"), 400
+    for segment in segments:
+        segment["rate"] = thai_rate if segment["voice"] == VOICE else english_rate
     job_id = uuid.uuid4().hex
     with jobs_lock:
         jobs[job_id] = {
@@ -286,7 +293,7 @@ def create_job():
             "error": None,
             "created": time.time(),
         }
-    threading.Thread(target=run_job, args=(job_id, segments, rate), daemon=True).start()
+    threading.Thread(target=run_job, args=(job_id, segments), daemon=True).start()
     return jsonify(id=job_id, total=len(segments))
 
 
