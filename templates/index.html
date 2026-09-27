@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="อ่านไทย MP3">
+  <meta name="theme-color" content="#1f6f5c">
+  <title>แปลงข้อความไทยเป็น MP3</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #f4f1ea;
+      --card: #ffffff;
+      --text: #1d2521;
+      --muted: #5f6b66;
+      --accent: #1f6f5c;
+      --accent-press: #17584a;
+      --border: #d9d4c7;
+      --error: #b3261e;
+      --radius: 16px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #151a18;
+        --card: #1f2623;
+        --text: #eef2ef;
+        --muted: #a3b0aa;
+        --accent: #4fb89b;
+        --accent-press: #3e9c82;
+        --border: #34403b;
+        --error: #ff8a80;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Sarabun", -apple-system, system-ui, sans-serif;
+      font-size: 18px;
+      line-height: 1.6;
+      -webkit-text-size-adjust: 100%;
+    }
+    main {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: max(24px, env(safe-area-inset-top)) 16px 48px;
+    }
+    h1 { font-size: 1.6rem; margin: 0 0 4px; }
+    .sub { color: var(--muted); margin: 0 0 20px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    textarea {
+      width: 100%;
+      min-height: 42vh;
+      resize: vertical;
+      padding: 14px;
+      font: inherit;
+      color: var(--text);
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+    }
+    textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: 12px;
+    }
+    .count { color: var(--muted); font-size: 0.95rem; }
+    .speed { display: flex; align-items: center; gap: 10px; flex: 1 1 260px; }
+    .speed input { flex: 1; accent-color: var(--accent); height: 32px; }
+    .speed output { min-width: 4.5em; text-align: right; font-variant-numeric: tabular-nums; }
+    button, .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      min-height: 52px;
+      padding: 0 24px;
+      border: 0;
+      border-radius: 12px;
+      font: inherit;
+      font-weight: 700;
+      text-decoration: none;
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .primary { background: var(--accent); color: #fff; width: 100%; margin-top: 16px; font-size: 1.1rem; }
+    .primary:active { background: var(--accent-press); }
+    .primary:disabled { opacity: 0.55; cursor: default; }
+    .secondary { background: transparent; color: var(--accent); border: 2px solid var(--accent); }
+    .progress { height: 10px; background: var(--border); border-radius: 99px; overflow: hidden; margin-top: 12px; }
+    .bar { height: 100%; width: 0; background: var(--accent); transition: width 0.3s; }
+    .status { margin: 0; }
+    .error { color: var(--error); font-weight: 600; }
+    audio { width: 100%; margin: 8px 0 16px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 12px; }
+    .actions .button { flex: 1 1 200px; }
+    .download { background: var(--accent); color: #fff; }
+    [hidden] { display: none !important; }
+    .hint { color: var(--muted); font-size: 0.9rem; margin: 12px 0 0; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>แปลงข้อความไทยเป็นไฟล์เสียง MP3</h1>
+  <p class="sub">เสียงผู้หญิง “เปรมวดี” (th-TH-PremwadeeNeural) · ข้อความยาวแค่ไหนก็รวมเป็นไฟล์เดียว</p>
+
+  <section class="card">
+    <textarea id="text" placeholder="วางข้อความภาษาไทยที่นี่…" maxlength="{{ max_chars }}"></textarea>
+    <div class="row">
+      <span class="count" id="count">0 ตัวอักษร</span>
+      <button class="secondary" id="clear" type="button">ล้างข้อความ</button>
+    </div>
+    <div class="row">
+      <label class="speed">
+        <span>ความเร็ว</span>
+        <input type="range" id="speed" min="-50" max="100" step="5" value="0">
+        <output id="speedOut">ปกติ</output>
+      </label>
+    </div>
+    <button class="primary" id="go" type="button">🔊 แปลงเป็น MP3</button>
+  </section>
+
+  <section class="card" id="progressCard" hidden>
+    <p class="status" id="status"></p>
+    <div class="progress"><div class="bar" id="bar"></div></div>
+  </section>
+
+  <section class="card" id="resultCard" hidden>
+    <p class="status"><strong>เสร็จแล้ว!</strong> <span id="size"></span></p>
+    <audio id="player" controls preload="auto"></audio>
+    <div class="actions">
+      <a class="button download" id="download" href="#">⬇️ ดาวน์โหลด MP3</a>
+    </div>
+    <p class="hint">บน iPad: กดดาวน์โหลดแล้วไฟล์จะอยู่ในแอป “ไฟล์” (Files) → โฟลเดอร์ “ดาวน์โหลด”</p>
+  </section>
+</main>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const textEl = $("text"), countEl = $("count"), speedEl = $("speed"), speedOut = $("speedOut");
+  const goBtn = $("go"), statusEl = $("status"), bar = $("bar");
+  const progressCard = $("progressCard"), resultCard = $("resultCard");
+  const player = $("player"), downloadLink = $("download"), sizeEl = $("size");
+
+  function load(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
+  function save(key, value) { try { localStorage.setItem(key, value); } catch (e) {} }
+
+  function updateCount() {
+    countEl.textContent = textEl.value.length.toLocaleString("th-TH") + " ตัวอักษร";
+  }
+  function updateSpeed() {
+    const v = Number(speedEl.value);
+    speedOut.textContent = v === 0 ? "ปกติ" : (v > 0 ? "+" : "") + v + "%";
+  }
+
+  textEl.value = load("tts-text") || "";
+  speedEl.value = load("tts-speed") || "0";
+  updateCount(); updateSpeed();
+
+  textEl.addEventListener("input", () => { updateCount(); save("tts-text", textEl.value); });
+  speedEl.addEventListener("input", () => { updateSpeed(); save("tts-speed", speedEl.value); });
+  $("clear").addEventListener("click", () => {
+    if (textEl.value && !confirm("ล้างข้อความทั้งหมด?")) return;
+    textEl.value = ""; updateCount(); save("tts-text", ""); textEl.focus();
+  });
+
+  function showError(msg) {
+    progressCard.hidden = false;
+    statusEl.innerHTML = "";
+    const span = document.createElement("span");
+    span.className = "error";
+    span.textContent = msg;
+    statusEl.appendChild(span);
+    bar.style.width = "0";
+  }
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  goBtn.addEventListener("click", async () => {
+    const text = textEl.value.trim();
+    if (!text) { showError("กรุณาวางข้อความก่อน"); return; }
+
+    goBtn.disabled = true;
+    resultCard.hidden = true;
+    player.removeAttribute("src");
+    progressCard.hidden = false;
+    statusEl.textContent = "กำลังเริ่ม… (ครั้งแรกหลังเว็บหลับอาจรอ ~1 นาที)";
+    bar.style.width = "3%";
+
+    try {
+      const res = await fetch("api/jobs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, speed: Number(speedEl.value) }),
+      });
+      const job = await res.json();
+      if (!res.ok) throw new Error(job.error || "เกิดข้อผิดพลาด");
+
+      let failures = 0;
+      while (true) {
+        await sleep(1000);
+        let info;
+        try {
+          const r = await fetch("api/jobs/" + job.id, { cache: "no-store" });
+          info = await r.json();
+          if (!r.ok) throw new Error(info.error || "เกิดข้อผิดพลาด");
+          failures = 0;
+        } catch (e) {
+          if (++failures >= 5) throw e;
+          continue;
+        }
+        if (info.status === "error") throw new Error(info.error);
+        const pct = info.total ? Math.round((info.done / info.total) * 100) : 0;
+        bar.style.width = Math.max(3, pct) + "%";
+        statusEl.textContent = `กำลังแปลงเสียง… ท่อนที่ ${info.done} / ${info.total} (${pct}%)`;
+        if (info.status === "finished") {
+          const url = "api/jobs/" + job.id + "/audio";
+          player.src = url;
+          downloadLink.href = url + "?download=1";
+          sizeEl.textContent = `ขนาดไฟล์ ${(info.size / 1024 / 1024).toFixed(2)} MB`;
+          progressCard.hidden = true;
+          resultCard.hidden = false;
+          resultCard.scrollIntoView({ behavior: "smooth", block: "start" });
+          break;
+        }
+      }
+    } catch (e) {
+      showError(e.message || String(e));
+    } finally {
+      goBtn.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>
